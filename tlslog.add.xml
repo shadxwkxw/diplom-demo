@@ -1,0 +1,6 @@
+<additional>
+    <!-- NOTE: tlLogicLog не создает tlslog.xml в SUMO 1.24.0 для actuated светофоров.
+         Вместо этого tlslog.xml генерируется программно в main.py из данных TraCI.
+         Этот файл сохранен для справки. -->
+    <!-- <tlLogicLog id="cluster_1781062862_1781062863_1853581175_1853581176_#2more" file="tlslog.xml"/> -->
+</additional>
