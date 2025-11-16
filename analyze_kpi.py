@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 # analyze_kpi.py: сравнение KPI между baseline и opt сценариями
-# Использует tripinfos.xml, summary.xml, edgeData.xml, laneData.xml из out/<run>/
+# Использует tripinfos.xml, summary.xml, laneData.xml из out/<run>/
 
 import os
 import sys
-import statistics as stats
 import xml.etree.ElementTree as ET
 from typing import Dict, Tuple, List
 
 Run = Tuple[str, str]  # (name, path)
-
 
 def pct(values: List[float], p: float) -> float:
     if not values:
@@ -23,7 +21,6 @@ def pct(values: List[float], p: float) -> float:
     d0 = values[f] * (c - k)
     d1 = values[c] * (k - f)
     return d0 + d1
-
 
 def parse_tripinfos(path: str) -> Dict[str, float]:
     m = {
@@ -52,10 +49,8 @@ def parse_tripinfos(path: str) -> Dict[str, float]:
     m["avg_travel"] = sum(durations) / len(durations) if durations else 0.0
     m["p95_travel"] = pct(durations, 0.95)
     m["avg_wait"] = sum(waits) / len(waits) if waits else 0.0
-    # departed можно получить из summary.xml; здесь приблизим как arrived
-    m["departed"] = arrived
+    m["departed"] = arrived  # приблизим
     return m
-
 
 def parse_summary(path: str) -> Dict[str, float]:
     m = {
@@ -70,7 +65,6 @@ def parse_summary(path: str) -> Dict[str, float]:
         for evt in ET.iterparse(path, events=("start",)):
             tag = evt[1].tag
             if tag.endswith("step"):
-                # поля зависят от версии SUMO; стараемся быть толерантными
                 ms = evt[1].get("meanSpeed") or evt[1].get("mean speed")
                 if ms is not None:
                     try:
@@ -96,7 +90,6 @@ def parse_summary(path: str) -> Dict[str, float]:
     m["total_waiting_time"] = sum(waiting) if waiting else 0.0
     return m
 
-
 def parse_lane_edge(path: str) -> Dict[str, float]:
     m = {"lane_speed_avg": 0.0, "lane_occupancy_avg": 0.0}
     if not os.path.exists(path):
@@ -106,7 +99,6 @@ def parse_lane_edge(path: str) -> Dict[str, float]:
         for evt in ET.iterparse(path, events=("start",)):
             tag = evt[1].tag
             if tag.endswith("interval"):
-                # meandata intervals may have aggregated stats
                 sp = evt[1].get("speed")
                 oc = evt[1].get("occupancy")
                 if sp is not None:
@@ -125,25 +117,23 @@ def parse_lane_edge(path: str) -> Dict[str, float]:
     m["lane_occupancy_avg"] = sum(occs) / len(occs) if occs else 0.0
     return m
 
-
 def load_run(run_path: str) -> Dict[str, Dict[str, float]]:
     return {
         "trip": parse_tripinfos(os.path.join(run_path, "tripinfos.xml")),
         "summary": parse_summary(os.path.join(run_path, "summary.xml")),
         "lane": parse_lane_edge(os.path.join(run_path, "laneData.xml")),
-        # edgeData.xml можно разобрать аналогично laneData.xml при необходимости
     }
-
 
 def fmt(v: float) -> str:
     return f"{v:.2f}"
 
-
 def print_compare(name: str, base: float, opt: float, better_when_lower: bool = True):
     delta = opt - base
-    sign = "↓" if (better_when_lower and opt < base) or ((not better_when_lower) and opt > base) else "↑" if delta != 0 else "="
+    if better_when_lower:
+        sign = "↓" if opt < base else ("↑" if opt > base else "=")
+    else:
+        sign = "↑" if opt > base else ("↓" if opt < base else "=")
     print(f"{name:24} base={fmt(base)}  opt={fmt(opt)}  diff={fmt(delta)} {sign}")
-
 
 def main():
     base_dir = os.path.join("out", "baseline")
@@ -162,7 +152,6 @@ def main():
     print_compare("total waiting time [s]", base["summary"]["total_waiting_time"], opt["summary"]["total_waiting_time"], True)
     print_compare("lane speed avg [m/s]", base["lane"]["lane_speed_avg"], opt["lane"]["lane_speed_avg"], better_when_lower=False)
     print_compare("lane occupancy avg", base["lane"]["lane_occupancy_avg"], opt["lane"]["lane_occupancy_avg"], True)
-
 
 if __name__ == "__main__":
     main()
