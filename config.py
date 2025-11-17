@@ -11,7 +11,7 @@ SUMO_HOME = os.environ.get(
 # Параметры симуляции
 SIM_STEPS = 3600          # 1 час симуляции (секунды)
 OPTIMIZE_INTERVAL = 300   # Оптимизация каждые 5 мин (шаги)
-GUI = False                # True = sumo-gui, False = sumo (без окна)
+GUI = True                # True = sumo-gui, False = sumo (без окна)
 
 # Файлы SUMO (твоя сеть/конфиг)
 NET_FILE = "./osm.net.xml.gz"

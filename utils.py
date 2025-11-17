@@ -152,36 +152,33 @@ def detect_near_miss():
 # Счётчик программ для уникальных ID
 _program_counter = 0
 
-def optimize_phases(near_miss_count, avg_risk, current_logic, tls_id):
+# Базовые (baseline) длительности фаз по каждому светофору:
+# tls_id -> np.array([...])
+_base_phase_durations = {}
+
+def _compute_phase_loads_by_waiting_time(tls_id, current_logic):
     """
-    Оптимизация фаз:
-    - считаем загрузку по фазам (сколько стоящих машин обслуживает каждая фаза)
-    - распределяем CYCLE_TIME пропорционально этой загрузке
-    - durations ≈ target при MIN/MAX и sum(durations) == CYCLE_TIME
+    Считает нагрузку по фазам как суммарное время ожидания всех машин
+    на полосах, которые получают зелёный в этой фазе.
+    ВАЖНО: считаем waitingTime прямо по via_lane из controlledLinks,
+    чтобы не терять внутренние полосы.
+    Возвращает np.array длиной = числу фаз.
     """
-    global _program_counter
-    _program_counter += 1
+    import numpy as np
 
     num_phases = len(current_logic.phases)
-    if num_phases == 0:
-        print("No phases in current_logic, skipping optimization")
-        return []
+    phase_loads = np.zeros(num_phases, dtype=float)
 
-    # 1) Связи сигналов -> полосы
     try:
         controlled_links = traci.trafficlight.getControlledLinks(tls_id)
     except Exception as e:
         print(f"Cannot get controlled links for {tls_id}: {e}")
-        return [phase.duration for phase in current_logic.phases]
+        return phase_loads
 
-    phase_loads = np.zeros(num_phases, dtype=float)
-
-    # controlled_links: список по индексу сигнала (len == len(state))
-    # каждая запись: список кортежей (from, to, via)
     for p_idx, phase in enumerate(current_logic.phases):
         state = phase.state
-        for sig_idx, char in enumerate(state):
-            if char not in ("G", "g"):
+        for sig_idx, ch in enumerate(state):
+            if ch not in ("G", "g"):
                 continue
             if sig_idx >= len(controlled_links):
                 continue
@@ -191,42 +188,111 @@ def optimize_phases(near_miss_count, avg_risk, current_logic, tls_id):
                     via_lane = link[2]
                 except Exception:
                     continue
+                # считаем waitingTime на этой полосе прямо сейчас
                 try:
-                    q = traci.lane.getLastStepHaltingNumber(via_lane)
+                    veh_ids = traci.lane.getLastStepVehicleIDs(via_lane)
                 except Exception:
-                    q = 0
-                phase_loads[p_idx] += q
+                    veh_ids = []
+                lane_wait = 0.0
+                for vid in veh_ids:
+                    try:
+                        lane_wait += traci.vehicle.getWaitingTime(vid)
+                    except Exception:
+                        pass
+                phase_loads[p_idx] += lane_wait
 
-    # 2) target-длительности пропорционально нагрузке
+    return phase_loads
+
+
+
+
+def optimize_phases(near_miss_count, avg_risk, current_logic, tls_id):
+    """
+    Адаптивная оптимизация фаз вокруг baseline:
+
+    - baseline-длительности (первая увиденная программа для tls_id) считаются эталоном;
+    - суммарная длина цикла остаётся той же, что у baseline;
+    - нагрузка фазы = суммарное waitingTime машин на обслуживаемых полосах;
+    - фазы с нагрузкой выше средней получают чуть больше зелёного, ниже — чуть меньше;
+    - изменения умеренные и сглажены по сравнению с текущими длительностями.
+    """
+    import numpy as np
+
+    global _program_counter, _base_phase_durations
+    _program_counter += 1
+
+    num_phases = len(current_logic.phases)
+    if num_phases == 0:
+        print("No phases in current_logic, skipping optimization")
+        return []
+
+    # --- 1. Базовые длительности (baseline) для данного TLS ---
+
+    current_durations = np.array([p.duration for p in current_logic.phases], dtype=float)
+
+    if tls_id not in _base_phase_durations:
+        _base_phase_durations[tls_id] = current_durations.copy()
+        print(f"[opt] Saved baseline durations for {tls_id}: {_base_phase_durations[tls_id]}")
+
+    base_durations = _base_phase_durations[tls_id]
+    base_cycle_time = float(base_durations.sum())
+    if base_cycle_time <= 0:
+        base_cycle_time = float(current_durations.sum())
+        if base_cycle_time <= 0:
+            base_cycle_time = CYCLE_TIME
+
+    # --- 2. Нагрузка по фазам (суммарный waitingTime на полосах фаз) ---
+
+    phase_loads = _compute_phase_loads_by_waiting_time(tls_id, current_logic)
     total_load = float(phase_loads.sum())
-    if total_load <= 0:
-        target = np.array([CYCLE_TIME / num_phases] * num_phases, dtype=float)
-    else:
-        target = (phase_loads / total_load) * CYCLE_TIME
 
-    target = np.clip(target, MIN_PHASE_DURATION, MAX_PHASE_DURATION)
+    if total_load <= 0.0:
+        # вообще никто нигде не ждёт – нет смысла что-то крутить
+        print("[opt] No waiting traffic detected, keeping baseline durations")
+        return base_durations.astype(int).tolist()
 
-    # 3) Оптимизация durations ≈ target
-    durations = cp.Variable(num_phases)
-    constraints = [
-        durations >= MIN_PHASE_DURATION,
-        durations <= MAX_PHASE_DURATION,
-        cp.sum(durations) == CYCLE_TIME,
-    ]
-    objective = cp.Minimize(cp.sum_squares(durations - target))
-    problem = cp.Problem(objective, constraints)
-    problem.solve()
+    mean_load = total_load / num_phases
+    delta_load = phase_loads - mean_load
 
-    if problem.status != cp.OPTIMAL:
-        print(f"Optimization failed with status {problem.status}, using current durations")
-        return [phase.duration for phase in current_logic.phases]
+    # --- 3. Поправка к baseline-длительностям ---
 
-    new_durations = [int(round(d)) for d in durations.value]
+    # Насколько агрессивно реагируем на разницу нагрузки.
+    # Нагрузка = суммарное waitingTime, числа могут быть большими, поэтому коэффициент маленький.
+    gain = 0.02  # можно потом оттюнить
+
+    raw_adjustment = gain * delta_load  # >0 => добавить секунд, <0 => отнять
+
+    proposed = base_durations + raw_adjustment
+
+    # Ограничения по MIN/MAX
+    proposed = np.clip(proposed, MIN_PHASE_DURATION, MAX_PHASE_DURATION)
+
+    # --- 4. Сглаживание: не слишком далеко от текущих фактических длительностей ---
+
+    alpha = 0.6  # 0..1: 1 = доверяем очередям, 0 = держимся за текущие durations
+    proposed = alpha * proposed + (1.0 - alpha) * current_durations
+
+    # --- 5. Нормализация суммарного цикла к base_cycle_time ---
+
+    sum_proposed = float(proposed.sum())
+    if sum_proposed <= 0:
+        proposed = base_durations.copy()
+        sum_proposed = float(proposed.sum())
+
+    scale = base_cycle_time / sum_proposed
+    proposed *= scale
+
+    # ещё раз подрежем по MIN/MAX
+    proposed = np.clip(proposed, MIN_PHASE_DURATION, MAX_PHASE_DURATION)
+
+    # --- 6. Округление и коррекция суммы после округления ---
+
+    new_durations = [int(round(d)) for d in proposed]
     total = sum(new_durations)
+    target_total = int(round(base_cycle_time))
 
-    # 4) Коррекция суммы до CYCLE_TIME
-    if total != CYCLE_TIME:
-        diff = CYCLE_TIME - total
+    if total != target_total:
+        diff = target_total - total
         i = 0
         while diff != 0 and i < num_phases:
             if diff > 0:
@@ -239,7 +305,8 @@ def optimize_phases(near_miss_count, avg_risk, current_logic, tls_id):
                 diff += sub
             i = (i + 1) % num_phases
 
-    # 5) Новый Logic и применение
+    # --- 7. Собираем новый Logic и применяем в SUMO ---
+
     new_phases = []
     for i, phase in enumerate(current_logic.phases):
         new_phases.append(
@@ -273,7 +340,12 @@ def optimize_phases(near_miss_count, avg_risk, current_logic, tls_id):
     except traci.TraCIException as e:
         print(f"TraCI error when applying new logic: {e}")
 
+    print(f"[opt] tls={tls_id} loads={phase_loads} base={base_durations} new={new_durations}")
     return new_durations
+
+
+
+
 
 def visualize_results(risk_history):
     """Визуализация трендов риска"""
