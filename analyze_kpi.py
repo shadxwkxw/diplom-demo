@@ -32,6 +32,7 @@ def parse_tripinfos(path: str) -> Dict[str, float]:
         "avg_travel": 0.0,
         "p95_travel": 0.0,
         "avg_wait": 0.0,
+        "total_wait": 0.0,
     }
     if not os.path.exists(path):
         return m
@@ -52,6 +53,7 @@ def parse_tripinfos(path: str) -> Dict[str, float]:
     m["avg_travel"] = sum(durations) / len(durations) if durations else 0.0
     m["p95_travel"] = pct(durations, 0.95)
     m["avg_wait"] = sum(waits) / len(waits) if waits else 0.0
+    m["total_wait"] = sum(waits) if waits else 0.0
     # departed можно получить из summary.xml; здесь приблизим как arrived
     m["departed"] = arrived
     return m
@@ -60,12 +62,11 @@ def parse_tripinfos(path: str) -> Dict[str, float]:
 def parse_summary(path: str) -> Dict[str, float]:
     m = {
         "mean_speed": 0.0,
-        "total_waiting_time": 0.0,
         "stopped_veh_avg": 0.0,
     }
     if not os.path.exists(path):
         return m
-    speeds, stopped, waiting = [], [], []
+    speeds, stopped = [], []
     try:
         for evt in ET.iterparse(path, events=("start",)):
             tag = evt[1].tag
@@ -77,38 +78,53 @@ def parse_summary(path: str) -> Dict[str, float]:
                         speeds.append(float(ms))
                     except Exception:
                         pass
-                st = evt[1].get("stoppedVehicles")
+                # stoppedVehicles может называться просто "stopped" в summary.xml
+                st = evt[1].get("stopped") or evt[1].get("stoppedVehicles")
                 if st is not None:
                     try:
                         stopped.append(float(st))
-                    except Exception:
-                        pass
-                wt = evt[1].get("waitingTime")
-                if wt is not None:
-                    try:
-                        waiting.append(float(wt))
                     except Exception:
                         pass
     except Exception:
         pass
     m["mean_speed"] = sum(speeds) / len(speeds) if speeds else 0.0
     m["stopped_veh_avg"] = sum(stopped) / len(stopped) if stopped else 0.0
-    m["total_waiting_time"] = sum(waiting) if waiting else 0.0
     return m
 
 
 def parse_lane_edge(path: str) -> Dict[str, float]:
+    """
+    Парсит meandata lane/edge файл и усредняет скорость и занятость по всем элементам.
+    Внутри <interval> значения находятся на дочерних узлах <lane> или <edge>.
+    """
     m = {"lane_speed_avg": 0.0, "lane_occupancy_avg": 0.0}
     if not os.path.exists(path):
         return m
     speeds, occs = [], []
     try:
-        for evt in ET.iterparse(path, events=("start",)):
-            tag = evt[1].tag
-            if tag.endswith("interval"):
-                # meandata intervals may have aggregated stats
-                sp = evt[1].get("speed")
-                oc = evt[1].get("occupancy")
+        # Парсим целиком дерево для надёжного доступа к дочерним узлам
+        tree = ET.parse(path)
+        root = tree.getroot()
+        # Ожидаемый формат: <meandata><interval>...<lane speed="..." occupancy="..."/></interval></meandata>
+        for interval in root.findall(".//interval"):
+            # Сначала пробуем lane-уровень (узлы lane вложены внутрь edge, поэтому используем .//lane)
+            for lane in interval.findall(".//lane"):
+                sp = lane.get("speed")
+                oc = lane.get("occupancy")
+                if sp is not None:
+                    try:
+                        speeds.append(float(sp))
+                    except Exception:
+                        pass
+                if oc is not None:
+                    try:
+                        occs.append(float(oc))
+                    except Exception:
+                        pass
+            # Затем пробуем edge-уровень (если файл edgeData.xml)
+            for edge in interval.findall(".//edge"):
+                sp = edge.get("speed")
+                oc = edge.get("occupancy")
                 if sp is not None:
                     try:
                         speeds.append(float(sp))
@@ -141,7 +157,12 @@ def fmt(v: float) -> str:
 
 def print_compare(name: str, base: float, opt: float, better_when_lower: bool = True):
     delta = opt - base
-    sign = "↓" if (better_when_lower and opt < base) or ((not better_when_lower) and opt > base) else "↑" if delta != 0 else "="
+    # Стрелки интерпретируем интуитивно: ↑ — улучшение, ↓ — ухудшение, = — без изменений
+    if base == opt:
+        sign = "="
+    else:
+        improved = (opt < base) if better_when_lower else (opt > base)
+        sign = "↑" if improved else "↓"
     print(f"{name:24} base={fmt(base)}  opt={fmt(opt)}  diff={fmt(delta)} {sign}")
 
 
@@ -159,7 +180,8 @@ def main():
     print_compare("avg wait [s/veh]", base["trip"]["avg_wait"], opt["trip"]["avg_wait"], True)
     print_compare("mean speed [m/s]", base["summary"]["mean_speed"], opt["summary"]["mean_speed"], better_when_lower=False)
     print_compare("stopped veh avg", base["summary"]["stopped_veh_avg"], opt["summary"]["stopped_veh_avg"], True)
-    print_compare("total waiting time [s]", base["summary"]["total_waiting_time"], opt["summary"]["total_waiting_time"], True)
+    # Суммарное время ожидания берём из tripinfos как сумму waitingTime по всем ТС
+    print_compare("total waiting time [s]", base["trip"]["total_wait"], opt["trip"]["total_wait"], True)
     print_compare("lane speed avg [m/s]", base["lane"]["lane_speed_avg"], opt["lane"]["lane_speed_avg"], better_when_lower=False)
     print_compare("lane occupancy avg", base["lane"]["lane_occupancy_avg"], opt["lane"]["lane_occupancy_avg"], True)
 

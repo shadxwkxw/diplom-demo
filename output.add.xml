@@ -5,5 +5,6 @@
 -->
 
 <additional xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/additional_file.xsd">
-   <edgeData id="wizard_example" period="3600" file="edgeData.xml"/>
+   <edgeData id="wizard_example" period="300" file="edgeData.xml"/>
+   <laneData id="wizard_lane" period="300" file="laneData.xml"/>
 </additional>

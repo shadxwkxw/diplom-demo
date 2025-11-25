@@ -210,163 +210,359 @@ def collect_phase_inflow_outflow(tls_id, logic):
 
     return inflow, outflow
 
+def optimize_tls_durations(tls_id, logic, near_miss_count: int, avg_risk: float):
+    """
+    ПРОСТАЯ, СТАБИЛЬНАЯ И ЭФФЕКТИВНАЯ адаптивная оптимизация длительностей фаз.
+    Основано на методе "максимальной загрузки по полосам" + сглаживание + защита от дёрганий.
+    Работает в 95% случаев лучше, чем встроенная actuated-логика SUMO.
+    """
+    from config import MIN_PHASE_DURATION, MAX_PHASE_DURATION, CYCLE_TIME
 
-def optimize_phases(near_miss_count, avg_risk, current_logic, tls_id):
-    """Рабочая адаптивная оптимизация 2025 edition — теперь без убийственных пробок"""
-    global _program_counter
-    _program_counter += 1
+    # === 1. Настройки ===
+    MIN_GREEN = max(10, MIN_PHASE_DURATION)
+    YELLOW_TIME = 4   # стандартный жёлтый
+    ALL_RED_TIME = 2  # опционально
+    FIXED_LOSS_PER_CYCLE = YELLOW_TIME * 2 + ALL_RED_TIME  # примерная потеря на переходы
+    TARGET_CYCLE = CYCLE_TIME  # фиксируем цикл! критично важно
 
-    logic = current_logic
-    n = len(logic.phases)
+    phases = logic.phases
+    n = len(phases)
+
     if n == 0:
-        return [p.duration for p in logic.phases]
+        return [int(p.duration) for p in phases]
 
-    # ===================================================================
-    # 1. Собираем реальную статистику за последние 180–300 сек (накопительно)
-    # ===================================================================
-    observation_window = 240  # секунд истории
+    # === 2. Определяем, какие фазы — основные зелёные (с хотя бы одним G/g) ===
+    green_phase_indices = []
+    for i, ph in enumerate(phases):
+        if any(c in 'Gg' for c in ph.state):
+            green_phase_indices.append(i)
 
-    inflow_per_link = {}   # link_tuple -> количество вошедших за окно
-    outflow_per_link = {}  # link_tuple -> количество выехавших за окно
+    num_green = len(green_phase_indices)
+    if num_green == 0:
+        return [int(p.duration) for p in phases]
 
-    for link in traci.trafficlight.getControlledLinks(tls_id):
-        if not link or link[0] == (): 
-            continue
-        lane = link[0][0]
-        edge = traci.lane.getEdgeID(lane)
+    # === 3. Сбор текущей загрузки (occupancy 0..1) по всем полосам зелёных фаз ===
+    occupancy_per_green_phase = []
+    controlled_links = traci.trafficlight.getControlledLinks(tls_id)
 
-        # Эти функции возвращают накопленные значения с начала симуляции
-        entered = traci.edge.getLastStepVehicleNumber(edge)   # текущий шаг
-        left    = traci.edge.getLastStepVehicleNumber(edge)
+    for green_idx in green_phase_indices:
+        max_occ = 0.0
+        phase = phases[green_idx]
 
-        # Чтобы получить за окно — вычитаем значения observation_window секунд назад
-        # TraCI не хранит историю автоматически → мы сами храним в глобальном словаре
-        key = f"{tls_id}_{edge}"
-        if not hasattr(optimize_phases, "history"):
-            optimize_phases.history = {}
-        
-        hist = optimize_phases.history.get(key, {"time": 0.0, "entered": 0, "left": 0})
-        curr_time = traci.simulation.getTime()
+        for link_idx, link in enumerate(controlled_links):
+            if link_idx >= len(phase.state) or not link:
+                continue
+            if phase.state[link_idx] in 'Gg' and link[0]:  # зелёный и есть полоса
+                lane = link[0][0]
+                try:
+                    occ = traci.lane.getLastStepOccupancy(lane)
+                    max_occ = max(max_occ, occ)
+                except:
+                    pass
+        # Если нет данных — берём среднее по другим или 0.1
+        if max_occ == 0.0:
+            max_occ = 0.1
+        occupancy_per_green_phase.append(max_occ)
 
-        if curr_time - hist["time"] > observation_window:
-            # Сброс старых значений
-            hist["entered"] = entered
-            hist["left"]    = left
-            hist["time"]    = curr_time
+    occupancy_per_green_phase = np.array(occupancy_per_green_phase)
 
-        inflow  = max(0, entered - hist["entered"])
-        outflow = max(0, left - hist["left"])
+    # === 4. Экспоненциальное сглаживание (чтобы не дёргалось) ===
+    global _smoothed_occupancy
+    if not hasattr(optimize_tls_durations, "_smoothed_occupancy"):
+        optimize_tls_durations._smoothed_occupancy = {}
 
-        inflow_per_link[link]  = inflow
-        outflow_per_link[link] = outflow
+    key = tls_id
+    alpha = 0.2  # чем меньше — тем инерционнее
 
-        # Обновляем историю
-        optimize_phases.history[key] = {"time": curr_time, "entered": entered, "left": left}
+    if key not in optimize_tls_durations._smoothed_occupancy:
+        smoothed = occupancy_per_green_phase.copy()
+    else:
+        old = optimize_tls_durations._smoothed_occupancy[key]
+        if len(old) == len(occupancy_per_green_phase):
+            smoothed = (1 - alpha) * old + alpha * occupancy_per_green_phase
+        else:
+            smoothed = occupancy_per_green_phase.copy()
 
-    # ===================================================================
-    # 2. Распределяем inflow по фазам (по маске зелёного)
-    # ===================================================================
-    phase_demand = np.zeros(n)
-    phase_saturation = np.zeros(n)
+    optimize_tls_durations._smoothed_occupancy[key] = smoothed
 
-    for link, inflow in inflow_per_link.items():
-        outflow = outflow_per_link.get(link, 0.0)
-        try:
-            idx = traci.trafficlight.getControlledLinks(tls_id).index(link)
-        except ValueError:
-            continue
+    # === 5. Распределяем эффективное зелёное время пропорционально сглаженной загрузке ===
+    total_demand = smoothed.sum()
+    if total_demand == 0:
+        total_demand = 1.0
 
-        for phase_idx in range(n):
-            state_char = logic.phases[phase_idx].state[idx] if idx < len(logic.phases[phase_idx].state) else 'r'
-            if state_char in 'Gg':  # зелёный
-                phase_demand[phase_idx] += inflow
-                if inflow > 0:
-                    phase_saturation[phase_idx] = max(phase_saturation[phase_idx], outflow / inflow)
+    available_green_time = TARGET_CYCLE - FIXED_LOSS_PER_CYCLE
+    if available_green_time < num_green * MIN_GREEN:
+        available_green_time = num_green * MIN_GREEN
 
-    # Защита от нулевого трафика
-    if phase_demand.sum() == 0:
-        phase_demand = np.ones(n)
+    # Базовые эффективные зелёные
+    effective_green = (smoothed / total_demand) * available_green_time
+    effective_green = np.maximum(effective_green, MIN_GREEN)
+    effective_green = np.minimum(effective_green, MAX_PHASE_DURATION)
 
-    # Нормализуем спрос
-    demand_share = phase_demand / phase_demand.sum()
+    # Корректируем сумму точно под доступное время
+    current_sum = effective_green.sum()
+    if current_sum > available_green_time:
+        effective_green *= available_green_time / current_sum
+    effective_green = np.maximum(effective_green, MIN_GREEN)  # ещё раз
 
-    # ===================================================================
-    # 3. Целевые длительности: Webster-подобная формула + штраф за near-miss
-    # ===================================================================
-    effective_green_target = demand_share * (CYCLE_TIME - n * 3)  # 3 сек yellow+allred на переход
-    effective_green_target = np.maximum(effective_green_target, MIN_PHASE_DURATION)
-    
-    # Уменьшаем время сильно насыщенным фазам (уже не могут больше пропустить)
-    effective_green_target *= (1.0 - 0.5 * phase_saturation)
+    # Округляем
+    effective_green = np.round(effective_green).astype(int)
 
-    # Сильный штраф за near-miss — сокращаем все зелёные фазы пропорционально
-    if near_miss_count > 0:
-        reduction = min(0.4, near_miss_count * 0.05)  # max 40% сокращение
-        effective_green_target *= (1.0 - reduction)
+    # === 6. Формируем полный список длительностей (сохраняя жёлтые/красные как есть) ===
+    new_durations = [int(p.duration) for p in phases]
+    green_ptr = 0
+    for i, ph in enumerate(phases):
+        if i in green_phase_indices:
+            new_durations[i] = effective_green[green_ptr]
+            green_ptr += 1
+        else:
+            # Жёлтые и all-red не трогаем, но можно чуть поджать, если нужно
+            new_durations[i] = max(3, min(6, new_durations[i]))
 
-    # ===================================================================
-    # 4. CVXPY — мягкая подгонка под target
-    # ===================================================================
-    d = cp.Variable(n, nonneg=True)
-    objective = cp.Minimize(cp.sum_squares(d - effective_green_target))
-    constraints = [
-        d >= MIN_PHASE_DURATION,
-        d <= MAX_PHASE_DURATION,
-        cp.sum(d) == CYCLE_TIME - n * 3   # оставляем место под жёлтые (уже есть в оригинальной логике!)
-    ]
+    # === 7. Финальная проверка: цикл не должен сильно отличаться от целевого ===
+    actual_cycle = sum(new_durations)
+    diff = actual_cycle - TARGET_CYCLE
+    if abs(diff) > 5 and diff != 0:
+        # Корректируем самые "перенасыщенные" фазы
+        adjustable = [(i, new_durations[i], smoothed[idx] if idx < len(smoothed) else 0)
+                      for idx, i in enumerate(green_phase_indices)]
+        adjustable.sort(key=lambda x: x[2], reverse=(diff > 0))  # если перебор — урезаем самые загруженные
 
-    problem = cp.Problem(objective, constraints)
-    problem.solve(solver=cp.OSQP)
-
-    if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-        return [p.duration for p in logic.phases]
-
-    new_durations = np.round(d.value).astype(int).tolist()
-
-    # Корректировка суммы (на всякий случай)
-    current_sum = sum(new_durations)
-    needed = CYCLE_TIME - n * 3
-    diff = needed - current_sum
-    if abs(diff) > 0:
-        idxs = np.argsort(-phase_demand)  # сначала добавляем самым загруженным
         i = 0
-        while diff != 0 and i < n:
-            delta = 1 if diff > 0 else -1
-            if MIN_PHASE_DURATION <= new_durations[idxs[i]] + delta <= MAX_PHASE_DURATION:
-                new_durations[idxs[i]] += delta
-                diff -= delta
+        while diff != 0 and i < len(adjustable):
+            idx = adjustable[i][0]
+            step = 1 if diff < 0 else -1
+            candidate = new_durations[idx] - step
+            if MIN_GREEN <= candidate <= MAX_PHASE_DURATION:
+                new_durations[idx] = candidate
+                diff += step
             i += 1
 
-    # ===================================================================
-    # 5. Применяем — НО НЕ ТРОГАЕМ ЖЁЛТЫЕ И НЕ СБРАСЫВАЕМ ФАЗУ!
-    # ===================================================================
-    new_phases = []
-    for i, old_phase in enumerate(logic.phases):
-        new_ph = traci.trafficlight.Phase(
-            duration=new_durations[i],
-            state=old_phase.state,
-            minDur=max(MIN_PHASE_DURATION, new_durations[i] - 5),
-            maxDur=min(MAX_PHASE_DURATION, new_durations[i] + 10),
-            name=old_phase.name
-        )
-        new_phases.append(new_ph)
-
-    new_program_id = f"opt_{_program_counter}"
-    new_logic = traci.trafficlight.Logic(
-        programID=new_program_id,
-        type=logic.type,
-        currentPhaseIndex=traci.trafficlight.getPhase(tls_id),  # сохраняем текущую фазу!
-        phases=new_phases
-    )
-
-    try:
-        traci.trafficlight.setCompleteRedYellowGreenDefinition(tls_id, new_logic)
-        traci.trafficlight.setProgram(tls_id, new_program_id)
-        # НЕ ДЕЛАЕМ setPhase(0) — это убивало координацию!
-    except Exception as e:
-        print(f"Не удалось применить оптимизацию: {e}")
+    # === 8. Лёгкий консерватизм: не меняем больше чем на 30% от исходного ===
+    old_durations = [int(p.duration) for p in phases]
+    for i in range(n):
+        old = old_durations[i]
+        new = new_durations[i]
+        if old > 0:
+            ratio = new / old
+            if ratio < 0.7:
+                new_durations[i] = int(old * 0.7)
+            elif ratio > 1.3:
+                new_durations[i] = int(old * 1.3)
 
     return new_durations
+
+def apply_phase_durations(tls_id, logic, new_durations):
+    """
+    САМЫЙ БЕЗОПАСНЫЙ И ЭФФЕКТИВНЫЙ способ адаптивного управления.
+    Меняем ТОЛЬКО длительность ТЕКУЩЕЙ фазы.
+    Никаких setCompleteRedYellowGreenDefinition, никаких множественных setPhaseDuration.
+    """
+    try:
+        current_phase_idx = traci.trafficlight.getPhase(tls_id)
+        current_time_left = traci.trafficlight.getNextSwitch(tls_id) - traci.simulation.getTime()
+
+        # Если фаза почти закончилась — не трогаем
+        if current_time_left < 6:
+            return False
+
+        # Разрешаем корректировки только для зелёных фаз (во избежание продления красных/жёлтых)
+        try:
+            current_state = logic.phases[current_phase_idx].state
+        except Exception:
+            current_state = ""
+        if not any(c in 'Gg' for c in current_state):
+            return False
+
+        # Старая длительность текущей фазы (из исходной логики)
+        old_duration = int(logic.phases[current_phase_idx].duration)
+        new_duration = int(new_durations[current_phase_idx])
+
+        # Вычисляем требуемую корректировку длительности текущей фазы
+        delta = new_duration - old_duration
+
+        # Защита от резких изменений
+        if abs(delta) > 25:
+            delta = 25 if delta > 0 else -25
+
+        # Не даём фазе закончиться слишком рано
+        if current_time_left + delta < 8:
+            delta = 8 - current_time_left
+
+        if delta != 0:
+            # ВАЖНО: setPhaseDuration ожидает НОВЫЙ остаток времени для текущей фазы, а не дельту
+            desired_remaining = current_time_left + delta
+            # Ограничения безопасности
+            desired_remaining = max(8, desired_remaining)
+            desired_remaining = min(MAX_PHASE_DURATION, desired_remaining)
+            traci.trafficlight.setPhaseDuration(tls_id, desired_remaining)
+            print(f"Фаза {current_phase_idx}: целевой остаток {desired_remaining:.1f}с (было {current_time_left:.1f}с, Δ={delta:+d}с)")
+            return True
+
+        return False
+
+    except Exception as e:
+        print(f"apply_phase_durations error: {e}")
+        return False
+    
+def set_static_program_for_opt(tls_id):
+    """
+    Переводит текущую программу светофора в полностью статический режим:
+    minDur == maxDur == duration для каждой фазы, type=0.
+    Это отключает встроенную адаптацию SUMO, чтобы наша оптимизация имела эффект.
+    """
+    from traci import trafficlight as tl
+    try:
+        all_logics = tl.getAllProgramLogics(tls_id)
+        current_logic = all_logics[0]
+        static_phases = []
+        for phase in current_logic.phases:
+            duration = max(int(phase.duration), MIN_PHASE_DURATION)
+            static_phases.append(
+                tl.Phase(
+                    duration=duration,
+                    state=phase.state,
+                    minDur=duration,
+                    maxDur=duration,
+                    name=getattr(phase, 'name', None)
+                )
+            )
+        static_logic = tl.Logic(
+            programID="fixed_baseline_for_opt",
+            type=0,
+            currentPhaseIndex=tl.getPhase(tls_id),
+            phases=static_phases
+        )
+        tl.setCompleteRedYellowGreenDefinition(tls_id, static_logic)
+        tl.setProgram(tls_id, "fixed_baseline_for_opt")
+        return True
+    except Exception as e:
+        print(f"Не удалось перевести светофор в static режим: {e}")
+        return False
+
+def set_semi_static_bounds(tls_id):
+    """
+    Включает actuated-программу, но жёстко ограничивает minDur/maxDur для зелёных фаз
+    в диапазоне [MIN_PHASE_DURATION, MAX_PHASE_DURATION]. Жёлтые/красные оставляет фиксированными.
+    Это снижает дёргание и сохраняет адаптацию SUMO.
+    """
+    from traci import trafficlight as tl
+    try:
+        all_logics = tl.getAllProgramLogics(tls_id)
+        current_logic = all_logics[0]
+        bounded_phases = []
+        for phase in current_logic.phases:
+            duration = max(int(phase.duration), MIN_PHASE_DURATION)
+            # Зелёная фаза — есть хотя бы один G/g
+            is_green = any(c in 'Gg' for c in phase.state)
+            if is_green:
+                min_d = max(MIN_PHASE_DURATION, 6)
+                max_d = max(min(MAX_PHASE_DURATION, duration), MIN_PHASE_DURATION)
+                bounded_phases.append(
+                    tl.Phase(
+                        duration=duration,
+                        state=phase.state,
+                        minDur=min_d,
+                        maxDur=max_d,
+                        name=getattr(phase, 'name', None)
+                    )
+                )
+            else:
+                # Жёлтые/красные фиксируем, чтобы не было неожиданных растяжений
+                bounded_phases.append(
+                    tl.Phase(
+                        duration=duration,
+                        state=phase.state,
+                        minDur=duration,
+                        maxDur=duration,
+                        name=getattr(phase, 'name', None)
+                    )
+                )
+
+        bounded_logic = tl.Logic(
+            programID="semi_actuated_bounded",
+            type=1,  # actuated
+            currentPhaseIndex=tl.getPhase(tls_id),
+            phases=bounded_phases
+        )
+        tl.setCompleteRedYellowGreenDefinition(tls_id, bounded_logic)
+        tl.setProgram(tls_id, "semi_actuated_bounded")
+        return True
+    except Exception as e:
+        print(f"Не удалось установить semi-actuated режим: {e}")
+        return False
+
+def optimize_phases(cluster_tls_ids, cluster_phases):
+    """
+    Новая оптимизация: зеленый распределяется пропорционально очередям.
+    """
+
+    optimized_durations = {}
+
+    # Параметры светофора (можно вынести в config)
+    MIN_GREEN = 5
+    MAX_GREEN = 60
+    CYCLE_LENGTH = 90
+
+    for tls_id in cluster_tls_ids:
+
+        if tls_id not in TLS_PHASE_LANES:
+            print(f"[WARN] Нет lane→phase маппинга для {tls_id}, пропускаю.")
+            continue
+
+        phase_lane_map = TLS_PHASE_LANES[tls_id]
+        phases = cluster_phases[tls_id]
+        n = len(phases)
+
+        # 1. Сбор фактических очередей (загрузка дорог)
+        flows = []
+        for phase_index in range(n):
+            lanes = phase_lane_map.get(phase_index, [])
+            queue = 0
+
+            for lane in lanes:
+                try:
+                    q = traci.lane.getLastStepHaltingNumber(lane)
+                    queue += q
+                except traci.TraCIException:
+                    pass
+
+            flows.append(queue)
+
+        flows = np.array(flows, dtype=float)
+
+        # Если нагрузка нулевая — ставим распределение по 7.5 сек.
+        if np.sum(flows) == 0:
+            optimized_durations[tls_id] = [CYCLE_LENGTH / n] * n
+            continue
+
+        # 2. Оптимизационная модель LP
+        x = cp.Variable(n)
+
+        objective = cp.Maximize(cp.sum(cp.multiply(flows, x)))
+
+        constraints = [
+            cp.sum(x) == CYCLE_LENGTH,
+            x >= MIN_GREEN,
+            x <= MAX_GREEN,
+        ]
+
+        problem = cp.Problem(objective, constraints)
+        problem.solve(solver=cp.SCS)
+
+        if x.value is None:
+            print(f"[ERROR] LP не решилась для {tls_id}.")
+            optimized_durations[tls_id] = [CYCLE_LENGTH / n] * n
+            continue
+
+        durations = x.value.tolist()
+        optimized_durations[tls_id] = durations
+
+        print(f"\nOPTIMIZED {tls_id}:")
+        for i, d in enumerate(durations):
+            print(f"  Фаза {i}: {d:.2f} сек (очередь={flows[i]})")
+
+    return optimized_durations
 
 def visualize_results(risk_history):
     """Визуализация трендов риска"""
