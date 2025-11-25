@@ -9,6 +9,10 @@ for f in tripinfos.xml stats.xml summary.xml edgeData.xml laneData.xml tlslog.xm
   [ -f "$f" ] && mv -f "$f" out/baseline/;
 done
 ```
+Новая версия запуска скрипта без оптимизации
+```
+python3 main.py --mode baseline --out out/baseline
+```
 ## Запуск скрипта с оптимизацией
 ```
 python3 main.py --mode opt
@@ -16,7 +20,15 @@ for f in tripinfos.xml stats.xml summary.xml edgeData.xml laneData.xml tlslog.xm
   [ -f "$f" ] && mv -f "$f" out/opt/;
 done
 ```
+Новая версия запуска скрипта с оптимизацией
+```
+python3 main.py --mode opt --out out/opt
+```
 ## Сравнение результатов
 ```
 python3 analyze_kpi.py
+```
+Новая версия скрипта для сравнения результатов
+```
+python3 analyze_kpi.py out/baseline out/opt
 ```
