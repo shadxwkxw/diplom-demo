@@ -241,28 +241,49 @@ def optimize_tls_durations(tls_id, logic, near_miss_count: int, avg_risk: float)
     if num_green == 0:
         return [int(p.duration) for p in phases]
 
-    # === 3. Сбор текущей загрузки (occupancy 0..1) по всем полосам зелёных фаз ===
+    # === 3. Сбор текущей загрузки по зелёным фазам: приоритет очереди (halting), затем число машин, затем occupancy ===
     occupancy_per_green_phase = []
     controlled_links = traci.trafficlight.getControlledLinks(tls_id)
 
     for green_idx in green_phase_indices:
-        max_occ = 0.0
         phase = phases[green_idx]
+        halting_sum = 0.0
+        veh_sum = 0.0
+        occ_max = 0.0
 
         for link_idx, link in enumerate(controlled_links):
             if link_idx >= len(phase.state) or not link:
                 continue
-            if phase.state[link_idx] in 'Gg' and link[0]:  # зелёный и есть полоса
-                lane = link[0][0]
-                try:
-                    occ = traci.lane.getLastStepOccupancy(lane)
-                    max_occ = max(max_occ, occ)
-                except:
-                    pass
-        # Если нет данных — берём среднее по другим или 0.1
-        if max_occ == 0.0:
-            max_occ = 0.1
-        occupancy_per_green_phase.append(max_occ)
+            if phase.state[link_idx] in 'Gg':  # зелёный
+                for lane_info in link:
+                    if not lane_info:
+                        continue
+                    lane_id = lane_info[0]
+                    try:
+                        halting_sum += traci.lane.getLastStepHaltingNumber(lane_id)
+                    except Exception:
+                        pass
+                    try:
+                        veh_sum += traci.lane.getLastStepVehicleNumber(lane_id)
+                    except Exception:
+                        pass
+                    try:
+                        occ = traci.lane.getLastStepOccupancy(lane_id)
+                        occ_max = max(occ_max, occ)
+                    except Exception:
+                        pass
+
+        # Композитная нагрузка: сначала очереди, затем машины, затем занятость
+        if halting_sum > 0:
+            load = halting_sum
+        elif veh_sum > 0:
+            load = veh_sum * 0.5
+        else:
+            load = occ_max * 10.0  # приводим 0..1 к масштабу единиц
+
+        if load <= 0:
+            load = 0.1
+        occupancy_per_green_phase.append(load)
 
     occupancy_per_green_phase = np.array(occupancy_per_green_phase)
 
